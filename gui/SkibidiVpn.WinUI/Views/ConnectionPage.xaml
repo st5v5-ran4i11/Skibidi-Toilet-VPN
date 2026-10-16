@@ -1,0 +1,9 @@
+<Page x:Class="SkibidiVpn.WinUI.Views.ConnectionPage" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <ScrollViewer><StackPanel Padding="22" Spacing="14">
+    <TextBlock Text="Подключение" FontSize="26" FontWeight="SemiBold"/>
+    <TextBlock x:Name="StatusText" Text="Ожидание подключения к Go backend…" Opacity="0.8"/>
+    <StackPanel Orientation="Horizontal" Spacing="8"><Button Content="Обновить" Click="Refresh_Click"/><Button Content="Переподключить выбранный" Click="Reconnect_Click"/><Button Content="Остановить сервис" IsEnabled="False" ToolTipService.ToolTip="Остановка одного сервиса отключена, пока backend не умеет безопасно удалить только его маршрут."/></StackPanel>
+    <Border Padding="14" CornerRadius="8" BorderThickness="1" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"><StackPanel Spacing="8"><TextBlock Text="Сервисы" FontSize="18" FontWeight="SemiBold"/><TextBlock x:Name="ServiceInfo" Text="В этой версии Go Service Manager ещё не предоставляет IPC API. Данные сервисов не подменяются фиктивными статусами." TextWrapping="Wrap"/><ListView x:Name="ServicesList" MinHeight="40" SelectionMode="Single"><ListView.ItemTemplate><DataTemplate><StackPanel Padding="6" Spacing="3"><TextBlock Text="{Binding Summary}" FontWeight="SemiBold"/><TextBlock Text="{Binding Detail}" FontSize="12" Opacity="0.8" TextWrapping="Wrap"/></StackPanel></DataTemplate></ListView.ItemTemplate></ListView></StackPanel></Border>
+    <Border Padding="14" CornerRadius="8" BorderThickness="1" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"><StackPanel Spacing="8"><TextBlock Text="Состояние backend" FontSize="18" FontWeight="SemiBold"/><TextBlock x:Name="PipelineText" Text="Pipeline: —"/><TextBlock x:Name="StageText" Text="Активный этап: —"/><TextBlock x:Name="RuntimeText" Text="Runtime: —" TextWrapping="Wrap"/></StackPanel></Border>
+  </StackPanel></ScrollViewer>
+</Page>
