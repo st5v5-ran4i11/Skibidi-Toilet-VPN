@@ -1,0 +1,68 @@
+services:
+  youtube:
+    enabled: true
+    probe_url: https://www.youtube.com/generate_204
+    domains:
+      - youtube.com
+      - "*.youtube.com"
+      - googlevideo.com
+      - "*.googlevideo.com"
+      - ytimg.com
+      - "*.ytimg.com"
+    target_nodes: 10
+    standby_nodes: 2
+    stickiness_ttl: 45m
+    health_interval: 30s
+  telegram:
+    enabled: true
+    probe_url: https://telegram.org
+    domains:
+      - telegram.org
+      - "*.telegram.org"
+      - t.me
+      - "*.t.me"
+    target_nodes: 10
+    standby_nodes: 2
+    stickiness_ttl: 45m
+    health_interval: 30s
+  discord:
+    enabled: true
+    probe_url: https://discord.com/api/v10/gateway
+    domains:
+      - discord.com
+      - "*.discord.com"
+      - discordapp.com
+      - "*.discordapp.com"
+    target_nodes: 10
+    standby_nodes: 2
+    stickiness_ttl: 45m
+    health_interval: 30s
+  instagram:
+    enabled: true
+    probe_url: https://instagram.com
+    domains:
+      - instagram.com
+      - "*.instagram.com"
+    target_nodes: 8
+    standby_nodes: 2
+    stickiness_ttl: 45m
+    health_interval: 30s
+  openai:
+    enabled: true
+    probe_url: https://openai.com
+    domains:
+      - openai.com
+      - "*.openai.com"
+    target_nodes: 8
+    standby_nodes: 2
+    stickiness_ttl: 45m
+    health_interval: 30s
+
+  gaming:
+    enabled: false
+    probe_url: https://www.cloudflare.com/cdn-cgi/trace
+    domains: []
+    target_nodes: 8
+    standby_nodes: 2
+    stickiness_ttl: 45m
+    health_interval: 30s

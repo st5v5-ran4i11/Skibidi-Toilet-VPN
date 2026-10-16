@@ -1,0 +1,43 @@
+app:
+    name: Skibidi_toilet_VPN
+    version: 6.0.4-dev
+paths:
+    data: ./data
+    logs: ./logs
+    output: ./output
+network_mode: mobile
+run_share_server: false
+all_services:
+    discord: https://discord.com/api/v10/gateway
+    instagram: https://instagram.com
+    openai: https://openai.com
+    telegram: https://telegram.org
+    youtube: https://www.youtube.com/generate_204
+fetcher:
+    timeout: 60
+    raw_path: ./data/cache
+    output_file: raw_dump.txt
+home_profile:
+    parser_workers: 5
+    fetcher_workers: 5
+    tcp_workers: 50
+    tcp_timeout_ms: 1000
+    deep_nodes_parallel: 1
+    deep_timeout_sec: 20
+    max_output_limit: 1500
+    stable_output_limit: 1500
+    enabled_services:
+        - telegram
+        - youtube
+mobile_profile:
+    parser_workers: 5
+    fetcher_workers: 5
+    tcp_workers: 150
+    tcp_timeout_ms: 3000
+    deep_nodes_parallel: 3
+    deep_timeout_sec: 20
+    max_output_limit: 1500
+    stable_output_limit: 1500
+    enabled_services:
+        - telegram
+        - youtube

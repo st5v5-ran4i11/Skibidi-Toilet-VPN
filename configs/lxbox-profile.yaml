@@ -1,0 +1,29 @@
+# Runtime reference for the LxBox ecosystem.
+# The Windows manager owns node selection and service pools.
+# LxBox remains a compatible consumer/runtime target; selection is owned by the manager.
+
+subscription:
+  url: "http://192.168.0.124:8000/subscriptions/all.txt"
+
+routing:
+  mechanism: "domain"
+  default: "direct"
+  process_routing: "fallback-only"
+
+dns:
+  remote_doh: "https://dns.google/dns-query"
+  direct_doh: "https://223.5.5.5/dns-query"
+
+services:
+  youtube:
+    domains: ["youtube.com", "*.youtube.com", "googlevideo.com", "*.googlevideo.com", "ytimg.com", "*.ytimg.com"]
+  telegram:
+    domains: ["telegram.org", "*.telegram.org", "t.me", "*.t.me"]
+  discord:
+    domains: ["discord.com", "*.discord.com", "discordapp.com", "*.discordapp.com"]
+
+lifecycle:
+  stickiness: true
+  failover: true
+  hot_standby: true
+  background_recovery: true

@@ -1,0 +1,5 @@
+# Recovery uses only a bounded subset of the main source catalog.
+max_sources_per_cycle: 8
+max_nodes_after_tcp: 300
+max_working_nodes: 12
+retry_cooldown: 10m
