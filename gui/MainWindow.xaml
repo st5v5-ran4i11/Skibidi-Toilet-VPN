@@ -1,0 +1,26 @@
+<Window
+    x:Class="SkibidiVpn.WinUI.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="using:Microsoft.UI.Xaml.Controls"
+    Title="Skibidi Toilet VPN">
+    <Grid MinWidth="720" MinHeight="520">
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+        <Border Padding="14,9" BorderThickness="0,0,0,1" BorderBrush="{ThemeResource DividerStrokeColorDefaultBrush}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal" Spacing="10"><TextBlock Text="Skibidi Toilet VPN" FontSize="18" FontWeight="SemiBold"/><TextBlock x:Name="BackendStatusText" Text="Backend: отключён" VerticalAlignment="Center" Opacity="0.8"/></StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8"><Ellipse x:Name="IpcIndicator" Width="9" Height="9" Fill="Gray" VerticalAlignment="Center"/><TextBlock x:Name="IpcStatusText" Text="IPC: нет соединения" VerticalAlignment="Center"/></StackPanel>
+            </Grid>
+        </Border>
+        <controls:NavigationView x:Name="Navigation" Grid.Row="1" IsBackButtonVisible="Collapsed" IsSettingsVisible="False" PaneDisplayMode="Left" SelectionChanged="Navigation_SelectionChanged">
+            <controls:NavigationView.MenuItems>
+                <controls:NavigationViewItem Content="Подключение" Tag="connection"><controls:NavigationViewItem.Icon><SymbolIcon Symbol="Globe"/></controls:NavigationViewItem.Icon></controls:NavigationViewItem>
+                <controls:NavigationViewItem Content="Проверка" Tag="check"><controls:NavigationViewItem.Icon><SymbolIcon Symbol="Refresh"/></controls:NavigationViewItem.Icon></controls:NavigationViewItem>
+                <controls:NavigationViewItem Content="Источники" Tag="sources"><controls:NavigationViewItem.Icon><SymbolIcon Symbol="List"/></controls:NavigationViewItem.Icon></controls:NavigationViewItem>
+                <controls:NavigationViewItem Content="Настройки" Tag="settings"><controls:NavigationViewItem.Icon><SymbolIcon Symbol="Setting"/></controls:NavigationViewItem.Icon></controls:NavigationViewItem>
+                <controls:NavigationViewItem Content="Логи" Tag="logs"><controls:NavigationViewItem.Icon><SymbolIcon Symbol="Document"/></controls:NavigationViewItem.Icon></controls:NavigationViewItem>
+            </controls:NavigationView.MenuItems>
+            <Frame x:Name="ContentFrame" />
+        </controls:NavigationView>
+    </Grid>
+</Window>
