@@ -1,0 +1,388 @@
+
+========== qwen36_tier.c : 1720 + 180 ==========
+ 1720: int qt_chain_layer_format(int layer,int *fmt,int *fmt_d){
+ 1721:     if(!G.on || layer<0 || layer>=G.nl) return 0;
+ 1722:     int f; qt_chain_format(&f,NULL);
+ 1723:     *fmt = G.wfmt==QT_GGUF ? 100+G_gtg[layer] : f;
+ 1724:     *fmt_d = G.wfmt==QT_GGUF ? 100+G_gtd[layer] : f;
+ 1725:     return 1;
+ 1726: }
+ 1727: 
+ 1728: int qt_is_resident(int layer,int eid){
+ 1729:     if(!G.on) return 0;
+ 1730:     pthread_mutex_lock(&G.mx);
+ 1731:     int r = qs(layer,eid)->resident;
+ 1732:     pthread_mutex_unlock(&G.mx);
+ 1733:     return r;
+ 1734: }
+ 1735: 
+ 1736: /* internal, G.mx held: enqueue one upload. victim=-1: plain upload (budget is
+ 1737:  * reserved here); victim>=0: LFRU swap (budget neutral). */
+ 1738: static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
+ 1739:     QSlot *s=qs(layer,eid);
+ 1740:     /* Nothing is accepted once shutdown has been requested: a waiter woken by
+ 1741:      * the shutdown broadcast (qt_note_block / qt_note_planned on a full queue)
+ 1742:      * would otherwise enqueue into a queue the uploader may already have left,
+ 1743:      * and that entry stays queued=1 with its staging buffers forever. */
+ 1744:     if(G.th_stop) return 0;
+ 1745:     if(s->resident||s->queued||!s->g4) return 0;
+ 1746:     if(G.qn>=QT_QCAP){ G.q_full_skips++; return 0; }
+ 1747:     int hd=home2(layer,eid);
+ 1748:     if(!reserved && v_eid<0 && G.used[hd]+qt_ebytes(layer)>G.budget[hd]) return 0;
+ 1749:     /* staging: three matrices (int8/fp8 a byte an element, a GGUF's the file's rows), their scales */
+ 1750:     uint8_t *w=malloc(2*qt_mb_gu(layer)+qt_mb_d(layer)); float *sc=malloc((2*G.sc_gu+G.sc_d+1)*sizeof(float));
+ 1751:     if(!w||!sc){ free(w); free(sc); return 0; }
+ 1752:     if(!reserved && v_eid<0) G.used[hd]+=qt_ebytes(layer);
+ 1753:     s->queued=1;
+ 1754:     stage(w,sc,layer,s->g4,s->u4,s->d4,s->gs,s->us,s->ds);
+ 1755:     G.q[G.qt_].layer=layer; G.q[G.qt_].eid=eid; G.q[G.qt_].w=w; G.q[G.qt_].s=sc;
+ 1756:     G.q[G.qt_].v_layer=v_layer; G.q[G.qt_].v_eid=v_eid;
+ 1757:     G.qt_=(G.qt_+1)%QT_QCAP; G.qn++; G.inflight++;
+ 1758:     pthread_cond_signal(&G.cv);
+ 1759:     return 1;
+ 1760: }
+ 1761: 
+ 1762: /* streaming mode: the bytes in hand are valid only during this call, so set
+ 1763:  * the pointers for the enqueue (which stages a copy under the lock) and drop
+ 1764:  * them again before returning. Nothing downstream may read them later. */
+ 1765: static void stream_point(QSlot *s,const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
+ 1766:                          const float *gs,const float *us,const float *ds){
+ 1767:     s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds;
+ 1768: }
+ 1769: static void stream_forget(QSlot *s){ s->g4=s->u4=s->d4=NULL; s->gs=s->us=s->ds=NULL; }
+ 1770: 
+ 1771: /* The LFRU decision at the moment the bytes pass by: if this expert is not
+ 1772:  * resident and its device has no room, evict the coldest resident there when
+ 1773:  * the admission rule says the newcomer is worth it. Budget-neutral swap. */
+ 1774: static void stream_promote_locked(int layer,int eid){
+ 1775:     QSlot *s=qs(layer,eid);
+ 1776:     if(s->resident||s->queued) return;
+ 1777:     int hd=home2(layer,eid);
+ 1778:     if(G.used[hd]+qt_ebytes(layer)<=G.budget[hd]){ enqueue_locked(layer,eid,-1,-1,0); return; }
+ 1779:     size_t n=(size_t)G.nl*G.ne; int cold=-1; uint32_t ch=0;
+ 1780:     for(size_t i=0;i<n;i++){
+ 1781:         QSlot *c=&G.slot[i];
+ 1782:         if(home2((int)(i/G.ne),(int)(i%G.ne))!=hd || !c->resident || c->queued || !swap_ok(layer,(int)(i/G.ne))) continue;
+ 1783:         if(cold<0||c->heat<ch){ cold=(int)i; ch=c->heat; }
+ 1784:     }
+ 1785:     if(cold<0 || !tier_should_promote(s->heat,ch)) return;
+ 1786:     QSlot *v=&G.slot[cold];
+ 1787:     res_set(v,0);
+ 1788:     if(enqueue_locked(layer,eid,cold/G.ne,cold%G.ne,0)) G.swaps++;
+ 1789:     else res_set(v,1);
+ 1790: }
+ 1791: 
+ 1792: void qt_note(int layer,int eid,
+ 1793:              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
+ 1794:              const float *gs,const float *us,const float *ds){
+ 1795:     if(!G.on || !g4 || G_trunk_only || G_chain_own) return;
+ 1796:     QSlot *s=qs(layer,eid);
+ 1797:     pthread_mutex_lock(&G.mx);
+ 1798:     if(G_stream){
+ 1799:         if(s->heat<0xFFFFFFFFu) s->heat++;
+ 1800:         stream_point(s,g4,u4,d4,gs,us,ds);
+ 1801:         stream_promote_locked(layer,eid);
+ 1802:         stream_forget(s);
+ 1803:         pthread_mutex_unlock(&G.mx);
+ 1804:         return;
+ 1805:     }
+ 1806:     if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
+ 1807:     if(s->heat<0xFFFFFFFFu) s->heat++;
+ 1808:     enqueue_locked(layer,eid,-1,-1,0);
+ 1809:     pthread_mutex_unlock(&G.mx);
+ 1810: }
+ 1811: 
+ 1812: /* The warm start's order from an engine's expert history (route_trace.h's counts, counts[l][e]
+ 1813:  * for nl layers of ne experts): qt_plan_fill hands out the most used first, as HEAT_FILE's. */
+ 1814: void qt_heat_order(uint32_t *const *counts, int nl, int ne){
+ 1815:     if(!G.on || !counts || nl!=G.nl || ne!=G.ne) return;
+ 1816:     pthread_mutex_lock(&G.mx);
+ 1817:     if(!G.heat0) G.heat0=malloc((size_t)nl*ne*4);
+ 1818:     if(G.heat0){
+ 1819:         for(int l=0;l<nl;l++) for(int e=0;e<ne;e++) G.heat0[(size_t)l*ne+e]=counts[l]?counts[l][e]:0;
+ 1820:         free(G.fill_order); G.fill_order=NULL;   /* sorted again at the next plan */
+ 1821:     }
+ 1822:     pthread_mutex_unlock(&G.mx);
+ 1823: }
+ 1824: /* Copy mode: whether a qt_note of this expert now would copy it (not resident nor queued,
+ 1825:  * and room on its device or a resident colder than it, as of the last tick), so an engine
+ 1826:  * converts the bytes only then; qt_note_heat counts a pass of one it does not hand over. */
+ 1827: int qt_note_wanted(int layer,int eid){
+ 1828:     if(!G.on || G_trunk_only || G_chain_own || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
+ 1829:     if(!G_stream) return 1;
+ 1830:     QSlot *s=qs(layer,eid);
+ 1831:     if(s->resident || s->queued) return 0;
+ 1832:     int hd=home2(layer,eid);
+ 1833:     if(G.used[hd]+qt_ebytes(layer)<=G.budget[hd]) return 1;
+ 1834:     return G_cold_heat[hd]!=0xFFFFFFFFu && tier_should_promote(s->heat+1,G_cold_heat[hd]);
+ 1835: }
+ 1836: void qt_note_heat(int layer,int eid){
+ 1837:     if(!G.on || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return;
+ 1838:     QSlot *s=qs(layer,eid);
+ 1839:     if(s->heat<0xFFFFFFFFu) __atomic_add_fetch(&s->heat,1u,__ATOMIC_RELAXED);
+ 1840: }
+ 1841: 
+ 1842: /* blocking variant for the warmstart (waits for queue space). */
+ 1843: void qt_note_block(int layer,int eid,
+ 1844:              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
+ 1845:              const float *gs,const float *us,const float *ds){
+ 1846:     if(!G.on || !g4 || G_trunk_only || G_chain_own) return;
+ 1847:     QSlot *s=qs(layer,eid);
+ 1848:     pthread_mutex_lock(&G.mx);
+ 1849:     if(G_stream) stream_point(s,g4,u4,d4,gs,us,ds);
+ 1850:     else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
+ 1851:     while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
+ 1852:     enqueue_locked(layer,eid,-1,-1,0);
+ 1853:     if(G_stream) stream_forget(s);
+ 1854:     pthread_mutex_unlock(&G.mx);
+ 1855: }
+ 1856: 
+ 1857: /* warmstart order -- heat descending (HEAT_FILE, or an engine's qt_heat_order), else expert
+ 1858:  * by expert across the layers: expert 0 of every layer, then expert 1, ... Index order
+ 1859:  * filled whole layers (a T4: layers 0-24 and part of 25 on the card, 26-39 none), and a
+ 1860:  * prompt chunk then copied each of those layers' 256 experts over the bus while it waited,
+ 1861:  * after 25 layers with the bus idle; spread, every layer copies its share beside the work of
+ 1862:  * the layer before. Under G.mx; 0: no memory. */
+ 1863: static const uint32_t *g_sort_heat;
+ 1864: static int cmp_heat_desc(const void *a,const void *b){
+ 1865:     uint32_t ha=g_sort_heat[*(const int*)a], hb=g_sort_heat[*(const int*)b];
+ 1866:     return ha<hb ? 1 : ha>hb ? -1 : 0;
+ 1867: }
+ 1868: static int fill_order_make(void){
+ 1869:     size_t n=(size_t)G.nl*G.ne;
+ 1870:     G.fill_order=malloc(n*sizeof(int));
+ 1871:     if(!G.fill_order) return 0;
+ 1872:     /* no heat: the i-th pick is layer i%nl, expert i/nl; with heat: index order, sorted below */
+ 1873:     for(size_t i=0;i<n;i++) G.fill_order[i]=G.heat0 ? (int)i : (int)((i%G.nl)*G.ne+i/G.nl);
+ 1874:     if(G.heat0){ g_sort_heat=G.heat0; qsort(G.fill_order,n,sizeof(int),cmp_heat_desc); }
+ 1875:     G.fill_cur=0;
+ 1876:     return 1;
+ 1877: }
+ 1878: /* Returns 0 once all budgets are full or the list is exhausted. */
+ 1879: int qt_fill_next(int *layer,int *eid){
+ 1880:     if(!G.on) return 0;
+ 1881:     size_t n=(size_t)G.nl*G.ne;
+ 1882:     pthread_mutex_lock(&G.mx);
+ 1883:     if(!G.fill_order && !fill_order_make()){ pthread_mutex_unlock(&G.mx); return 0; }
+ 1884:     while((size_t)G.fill_cur<n){
+ 1885:         int gi=G.fill_order[G.fill_cur];
+ 1886:         int l=gi/G.ne, e=gi%G.ne, hd=home2(l,e);
+ 1887:         QSlot *s=qs(l,e);
+ 1888:         int full=1; for(int i=0;i<G.ndev;i++) if(G.used[i]+qt_ebytes_min()<=G.budget[i]) full=0;
+ 1889:         if(full){ pthread_mutex_unlock(&G.mx); return 0; }
+ 1890:         G.fill_cur++;
+ 1891:         if(s->resident||s->queued) continue;
+ 1892:         if(G.used[hd]+qt_ebytes(l)>G.budget[hd]) continue;   /* dieses Device voll */
+ 1893:         *layer=l; *eid=e;
+ 1894:         pthread_mutex_unlock(&G.mx);
+ 1895:         return 1;
+ 1896:     }
+ 1897:     pthread_mutex_unlock(&G.mx);
+ 1898:     return 0;
+ 1899: }
+
+========== qwen36_cuda_chain.h : 1450 + 100 ==========
+ 1450: /* The staged table of a GGUF's experts (q36cc_stage_table): each layer's experts in the host pool
+ 1451:  * at slots of the largest layer's three matrices, 256-byte aligned each; one copy an expert where
+ 1452:  * its gate and up end on 256 bytes (its rows back to back as the RAM holds them), else three. */
+ 1453: static int q36cc_stage_table_gguf(Q36CChain *ch, Model *m) {
+ 1454:     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts;
+ 1455:     size_t ne = (size_t)L * E, stride = 0;
+ 1456:     int hmax = 0, tot = 0;
+ 1457:     for (int i = 0; i < L; i++) {
+ 1458:         size_t mg, md;
+ 1459:         if (q36_dense_l(c, i) || !q36cc_gguf_dims(m, i, &mg, &md)) continue;
+ 1460:         size_t st = 2 * ((mg + 255) / 256 * 256) + (md + 255) / 256 * 256;
+ 1461:         if (st > stride) stride = st;
+ 1462:         int h = 0;
+ 1463:         for (int e = 0; e < E; e++) {
+ 1464:             const void *w; const float *sc; size_t a, b;
+ 1465:             if (!ch->dm_res[(size_t)i * E + e] && qt_chain_host(i, e, &w, &a, &sc, &b) && a == 2 * mg + md) h++;
+ 1466:         }
+ 1467:         if (h > hmax) hmax = h;
+ 1468:         tot += h;
+ 1469:     }
+ 1470:     if (!ch->dm_hostb) {
+ 1471:         ch->dm_hostb = malloc(ne * sizeof(CcExpert));
+ 1472:         ch->dm_partb = calloc(L, sizeof(int)); ch->dm_fro = calloc(L, sizeof(int)); ch->dm_frn = calloc(L, sizeof(int));
+ 1473:         if (!ch->dm_hostb || !ch->dm_partb || !ch->dm_fro || !ch->dm_frn) return 0;
+ 1474:     }
+ 1475:     CcFetch *fr = realloc(ch->dm_fr, (size_t)(3 * tot + 1) * sizeof(CcFetch));
+ 1476:     if (!fr) return 0;
+ 1477:     ch->dm_fr = fr;
+ 1478:     /* the room the tier left the mirrors at the context's length stays free (a window's or sinks'
+ 1479:      * model's, q36cc_mirror_bytes): another model's mirrors take the staging's memory back when
+ 1480:      * they grow (q36cc_stage_drop). Kept for every model, Qwen3.6 UD-Q4_K_M with 7 GiB free kept
+ 1481:      * 1.3 GB that no one had set aside and found none to stage in: 97 tok/s for any prompt. */
+ 1482:     size_t fb = 0, tb = 0, full = q36cc_mirror_bytes(m, qwen36_max_ctx()), held = q36cc_mirror_held(ch, m);
+ 1483:     size_t left = full > held ? full - held : 0, need = (size_t)(hmax ? hmax : 1) * stride;
+ 1484:     if (!ch->dm_stage && coli_cuda_mem_info(ch->dev, &fb, &tb) && fb < need + left + ((size_t)256 << 20)) return 0;
+ 1485:     if (!stride || !q36cc_stage_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride) ||
+ 1486:         !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV)) return 0;
+ 1487:     const char *base = (const char *)cc_dev_addr(ch->dm_stage);
+ 1488:     if (!base) return 0;
+ 1489:     int k = 0;
+ 1490:     for (int i = 0; i < L; i++) {
+ 1491:         size_t mg = 0, md = 0;
+ 1492:         const int dims = !q36_dense_l(c, i) && q36cc_gguf_dims(m, i, &mg, &md);
+ 1493:         const size_t ag = (mg + 255) / 256 * 256;
+ 1494:         const int one = mg % 256 == 0;   /* gate and up end on 256 bytes: the rows as they are, one copy */
+ 1495:         int h = 0, miss = 0;
+ 1496:         ch->dm_fro[i] = k;
+ 1497:         for (int e = 0; e < E; e++) {
+ 1498:             size_t j = (size_t)i * E + e;
+ 1499:             CcExpert *x = &ch->dm_hostb[j];
+ 1500:             const void *w; const float *sc; size_t a, b;
+ 1501:             *x = ch->dm_host[j];
+ 1502:             if (ch->dm_res[j]) continue;
+ 1503:             memset(x, 0, sizeof *x);
+ 1504:             if (!dims || h >= hmax || k + 3 > 3 * tot || !qt_chain_host(i, e, &w, &a, &sc, &b) || a != 2 * mg + md) { miss = 1; continue; }
+ 1505:             const size_t at = (size_t)h * stride;
+ 1506:             const char *g = base + at;
+ 1507:             x->g = g; x->u = g + ag; x->d = g + 2 * ag;
+ 1508:             if (one) fr[k++] = (CcFetch){w, at, 2 * mg + md};
+ 1509:             else {
+ 1510:                 fr[k++] = (CcFetch){w, at, mg};
+ 1511:                 fr[k++] = (CcFetch){(const char *)w + mg, at + ag, mg};
+ 1512:                 fr[k++] = (CcFetch){(const char *)w + 2 * mg, at + 2 * ag, md};
+ 1513:             }
+ 1514:             h++;
+ 1515:         }
+ 1516:         ch->dm_frn[i] = k - ch->dm_fro[i]; ch->dm_partb[i] = miss;
+ 1517:     }
+ 1518:     return cc_begin() && cc_write(ch->dm_tabb, 0, ch->dm_hostb, ne * sizeof(CcExpert)) && cc_submit(1);
+ 1519: }
+ 1520: static int q36cc_stage_table(Q36CChain *ch, Model *m) {
+ 1521:     if (ch->dm_fmt >= 100) return q36cc_stage_table_gguf(ch, m);
+ 1522:     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, D = c->hidden, I = c->inter;
+ 1523:     size_t ne = (size_t)L * E, mb = (size_t)D * I / 2, nsc = (size_t)I * (D / ch->dm_gs), wb = 3 * mb, sb = 3 * nsc * sizeof(float);
+ 1524:     size_t wa = (wb + 255) / 256 * 256, stride = wa + (sb + 255) / 256 * 256;
+ 1525:     int hmax = 0, tot = 0;
+ 1526:     for (int i = 0; i < L; i++) {
+ 1527:         int h = 0;
+ 1528:         for (int e = 0; e < E; e++) {
+ 1529:             const void *w; const float *sc; size_t a, b;
+ 1530:             if (ch->dm_res[(size_t)i * E + e] || !qt_chain_host(i, e, &w, &a, &sc, &b)) continue;
+ 1531:             if (a != wb || b != sb) return 0;   /* not the layout the table describes */
+ 1532:             h++;
+ 1533:         }
+ 1534:         if (h > hmax) hmax = h;
+ 1535:         tot += h;
+ 1536:     }
+ 1537:     if (!ch->dm_hostb) {
+ 1538:         ch->dm_hostb = malloc(ne * sizeof(CcExpert));
+ 1539:         ch->dm_partb = calloc(L, sizeof(int)); ch->dm_fro = calloc(L, sizeof(int)); ch->dm_frn = calloc(L, sizeof(int));
+ 1540:         if (!ch->dm_hostb || !ch->dm_partb || !ch->dm_fro || !ch->dm_frn) return 0;
+ 1541:     }
+ 1542:     CcFetch *fr = realloc(ch->dm_fr, (size_t)(2 * tot + 1) * sizeof(CcFetch));
+ 1543:     if (!fr) return 0;
+ 1544:     ch->dm_fr = fr;
+ 1545:     if (!q36cc_stage_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
+ 1546:         return 0;
+ 1547:     const char *base = (const char *)cc_dev_addr(ch->dm_stage);
+ 1548:     if (!base) return 0;
+ 1549:     int k = 0;
+
+========== PROMOTION CALL SITES ==========
+
+  qwen36_cuda_chain.h:305:            if (b > st) st = b;
+  qwen36_cuda_chain.h:306:        }
+  qwen36_cuda_chain.h:307:    }
+  qwen36_cuda_chain.h:308:    return st;
+  qwen36_cuda_chain.h:309:}
+> qwen36_cuda_chain.h:310:static void q36cc_promote_settle(Q36CChain *ch);
+  qwen36_cuda_chain.h:311:static void q36cc_free_own(Q36CChain *ch, Model *m) {
+> qwen36_cuda_chain.h:312:    q36cc_promote_settle(ch);   /* the copies in flight: landed (the finish before) or failed (a lost device) */
+  qwen36_cuda_chain.h:313:    int L = m->c.n_layers;
+  qwen36_cuda_chain.h:314:    if (ch->t_ab) for (int i = 0; i < L; i++) { if (ch->t_ab[i]) coli_cuda_tensor_free(ch->t_ab[i]); ch->t_ab[i] = NULL; }
+  qwen36_cuda_chain.h:315:    if (ch->t_sg) for (int i = 0; i < L; i++) { if (ch->t_sg[i]) coli_cuda_tensor_free(ch->t_sg[i]); ch->t_sg[i] = NULL; }
+  qwen36_cuda_chain.h:316:    if (ch->t_gate) for (int i = 0; i < L; i++) { if (ch->t_gate[i]) coli_cuda_tensor_free(ch->t_gate[i]); ch->t_gate[i] = NULL; }
+  qwen36_cuda_chain.h:317:    if (ch->rec) for (int i = 0; i < L; i++) { cc_free(ch->rec[i]); ch->rec[i] = NULL; }
+  qwen36_cuda_chain.h:318:    if (ch->ring) for (int i = 0; i < L; i++) { cc_free(ch->ring[i]); ch->ring[i] = NULL; }
+  qwen36_cuda_chain.h:319:    if (ch->kc) for (int i = 0; i < L; i++) { cc_free(ch->kc[i]); ch->kc[i] = NULL; }
+  qwen36_cuda_chain.h:320:    if (ch->vc) for (int i = 0; i < L; i++) { cc_free(ch->vc[i]); ch->vc[i] = NULL; }
+  qwen36_cuda_chain.h:1348:    return on;
+  qwen36_cuda_chain.h:1349:}
+  qwen36_cuda_chain.h:1350:/* the pairs whose copies landed: the tier hands the buffers over; then this step's promotions,
+  qwen36_cuda_chain.h:1351: * unless the brake holds: the last Q36CC_PROMO_WIN decode steps (this one among them, rows
+  qwen36_cuda_chain.h:1352: * rows each) found promo_hits percent or more of their routes on the card */
+> qwen36_cuda_chain.h:1353:static void q36cc_promote(Q36CChain *ch, Model *m, int rows) {
+  qwen36_cuda_chain.h:1354:    Cfg *c = &m->c; int D = c->hidden, I = c->inter, K = c->topk;
+  qwen36_cuda_chain.h:1355:    if (qt_streaming() || ch->promo_rate <= 0) return;
+  qwen36_cuda_chain.h:1356:    double t0 = tm_now();
+  qwen36_cuda_chain.h:1357:    unsigned route = (unsigned)((ch->dm_steps - ch->pr_steps0) * (unsigned long long)rows * (unsigned long long)K), miss = (unsigned)(ch->dm_pairs - ch->pr_pairs0);
+  qwen36_cuda_chain.h:1358:    ch->pr_steps0 = ch->dm_steps; ch->pr_pairs0 = ch->dm_pairs;
+  qwen36_cuda_chain.h:1359:    ch->pr_wroute[ch->pr_wi] = route; ch->pr_wmiss[ch->pr_wi] = miss;
+  qwen36_cuda_chain.h:1360:    ch->pr_wi = (ch->pr_wi + 1) % Q36CC_PROMO_WIN; if (ch->pr_wn < Q36CC_PROMO_WIN) ch->pr_wn++;
+  qwen36_cuda_chain.h:1361:    int w = 0;
+  qwen36_cuda_chain.h:1406:        ch->dm_promoted++;
+  qwen36_cuda_chain.h:1407:    }
+  qwen36_cuda_chain.h:1408:    ch->promo_ms += tm_now() - t0;
+  qwen36_cuda_chain.h:1409:}
+  qwen36_cuda_chain.h:1410:/* at the chain's end: the copies in flight finished first (cc_finish), the pairs settled */
+> qwen36_cuda_chain.h:1411:static void q36cc_promote_settle(Q36CChain *ch) {
+  qwen36_cuda_chain.h:1412:    for (int p = 0; p < ch->pr_npend; p++) { qt_chain_promote_done(ch->pr_pend[p].ci, ch->pr_pend[p].vi, cc_host_up_done(ch->pr_pend[p].tk)); ch->pr_busy[ch->pr_pend[p].slot] = 0; }
+  qwen36_cuda_chain.h:1413:    ch->pr_npend = 0;
+  qwen36_cuda_chain.h:1414:}
+  qwen36_cuda_chain.h:1415:/* The staging buffer for a layer's host-pool experts. With the residents spread over the layers hmax (the most
+  qwen36_cuda_chain.h:1416: * experts one layer has off the card) starts below the layer's 256 and every promotion can raise it; cc_reserve
+  qwen36_cuda_chain.h:1417: * makes the new buffer before it frees the old one, so each growth wanted both at once. On an 8 GB card the
+  qwen36_cuda_chain.h:1418: * second allocation failed in the middle of a conversation and the staging stayed off for the process (the
+  qwen36_cuda_chain.h:1419: * RTX 3070 agent session in docs/experiments). A bigger buffer takes the old one's place: free it first. */
+  qwen36_cuda_chain.h:1599:    if (!cc_reserve(&ch->dm_ids, (size_t)L * r * K * 4, CC_DEV) || !cc_reserve(&ch->dm_w, (size_t)L * r * K * F, CC_DEV) ||
+  qwen36_cuda_chain.h:1600:        !cc_reserve(&ch->dm_idsd, (size_t)L * r * K * 4, CC_DOWN) || !cc_reserve(&ch->dm_wd, (size_t)L * r * K * F, CC_DOWN) ||
+  qwen36_cuda_chain.h:1601:        !cc_reserve(&ch->dm_hid, cc_moe_hid_floats((int)r, K, D, I, E) * F, CC_DEV) || !cc_reserve(&ch->dm_y, r * D * F, CC_DEV) ||
+  qwen36_cuda_chain.h:1602:        !cc_reserve(&ch->dm_hy, r * D * F, CC_UP) || !cc_reserve(&ch->dm_dfl, 64, CC_DOWN) || !cc_reserve(&ch->dm_hfl, 64, CC_UP) ||
+  qwen36_cuda_chain.h:1603:        !cc_reserve(&ch->dm_tab, ne * sizeof(CcExpert), CC_DEV)) return 0;
+> qwen36_cuda_chain.h:1604:    if (!ch->dm_held) { qt_chain_hold(1); ch->dm_held = 1; }
+  qwen36_cuda_chain.h:1605:    unsigned ep = qt_chain_epoch();
+  qwen36_cuda_chain.h:1606:    if (!ch->dm_read || ep != ch->dm_epoch) {
+  qwen36_cuda_chain.h:1607:        /* the residents that moved since the last read: those entries alone, or every entry
+  qwen36_cuda_chain.h:1608:         * where the tier lost count (the first read, a host-pool registration, too many) */
+  qwen36_cuda_chain.h:1609:        double tp = tm_now();
+  qwen36_cuda_chain.h:1610:        int chg[QT_CHG_LIST], nchg, over;
+  qwen36_cuda_chain.h:1611:        nchg = qt_chain_changes(chg, QT_CHG_LIST, &over);
+  qwen36_cuda_chain.h:1612:        if (over || !ch->dm_read) {
+  qwen36_cuda_chain.h:1664:        for (int k = 0; k < ch->dm_frn[i]; k++) ch->dm_stage_bytes += ch->dm_fr[ch->dm_fro[i] + k].bytes;
+  qwen36_cuda_chain.h:1665:        return cc_fetch(ch->dm_stage, ch->dm_fr + ch->dm_fro[i], ch->dm_frn[i]);
+  qwen36_cuda_chain.h:1666:    }
+  qwen36_cuda_chain.h:1667:    return 1;
+  qwen36_cuda_chain.h:1668:}
+> qwen36_cuda_chain.h:1669:static void q36cc_dm_end(Q36CChain *ch) { if (ch->dm_held) { qt_chain_hold(0); ch->dm_held = 0; } }
+  qwen36_cuda_chain.h:1670:/* layer i's router, routing, shared expert and the device's experts; *v: the host's word
+  qwen36_cuda_chain.h:1671: * a hybrid layer waits for (0: none) */
+  qwen36_cuda_chain.h:1672:static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsigned *v) {
+  qwen36_cuda_chain.h:1673:    Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
+  qwen36_cuda_chain.h:1674:    int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1, io = i * n * K;
+  qwen36_cuda_chain.h:1675:    CcRoute rp = {n, E, K, c->router_sigmoid ? 1 : 0, 0, E + ch->rgf[i], 0, 0, io, K, io, K, ng, ng > 1 ? c->topk_group : 1, 1, 1.f, 1.f, 0.f};
+  qwen36_cuda_chain.h:1676:    int part;
+  qwen36_cuda_chain.h:1677:    CcBuf *tab = q36cc_dm_tab(ch, i, n, &part);
+  qwen36_cuda_chain.h:1736:        const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * n * K;
+  qwen36_cuda_chain.h:1737:        for (int s = 0; s < n; s++) {
+  qwen36_cuda_chain.h:1738:            const int *idx = ids + s * K;
+  qwen36_cuda_chain.h:1739:            if (m->resident_collecting) for (int k = 0; k < K; k++) if (idx[k] >= 0) m->seen[(int64_t)i * E + idx[k]] = 1;
+  qwen36_cuda_chain.h:1740:            if (!m->hot_pinned && m->freq) for (int k = 0; k < K; k++) if (idx[k] >= 0) m->freq[(int64_t)i * E + idx[k]]++;
+> qwen36_cuda_chain.h:1741:            qt_chain_count(i, idx, K);
+  qwen36_cuda_chain.h:1742:        }
+  qwen36_cuda_chain.h:1743:    }
+  qwen36_cuda_chain.h:1744:}
+  qwen36_cuda_chain.h:1745:
+  qwen36_cuda_chain.h:1746:/* Rows per prompt chunk: COLI_CUDA_CHAIN_ROWS, else the most (a power of two from 256 to 4096)
+  qwen36_cuda_chain.h:1747: * whose scratch takes at most half the device's free memory once the tier filled it, less the
+  qwen36_cuda_chain.h:1748: * host pool's staging (the other half for the KV mirrors as the context grows). A chunk reads
+  qwen36_cuda_chain.h:1749: * every routed expert's weights once, the host pool's over the bus: the more rows, the fewer
+  qwen36_cuda_chain.h:1994:        if (ok && pend_v) ok = q36cc_dm_serve(ch, m, pend_i, n, pend_v);   /* the last hybrid layer's, the tail recorded */
+  qwen36_cuda_chain.h:1995:        ok = ok && cc_finish();
+  qwen36_cuda_chain.h:1996:        ch->wait_ms += tm_now() - t0;
+  qwen36_cuda_chain.h:1997:        if (!ok) goto lost;
+  qwen36_cuda_chain.h:1998:        if (dm) q36cc_dm_books(ch, m, n, pb);
+> qwen36_cuda_chain.h:1999:        if (dm && n <= Q36CC_DM_ROWS) q36cc_promote(ch, m, n);
+  qwen36_cuda_chain.h:2000:        else if (dm) { ch->pr_steps0 = ch->dm_steps; ch->pr_pairs0 = ch->dm_pairs; }   /* a prompt chunk's misses are not the brake's */
+  qwen36_cuda_chain.h:2001:        /* a dense model reads its K/V rows back here, and so does a Flint dense layer (no
+  qwen36_cuda_chain.h:2002:         * expert step ends its frame; q36c_forward_seg says what went wrong without it) */
+  qwen36_cuda_chain.h:2003:        for (int i = 0; i < L; i++) {
+  qwen36_cuda_chain.h:2004:            if (!c->is_attn[i] || (E > 0 && !q36_dense_l(c, i))) continue;
+  qwen36_cuda_chain.h:2005:            q36cc_kv_down(ch, m, i, n, pb);
+  qwen36_cuda_chain.h:2006:        }
+  qwen36_cuda_chain.h:2007:        if (want_x) memcpy(xh + (size_t)c0 * D, cc_ptr(ch->xd), (size_t)n * D * sizeof(float));
+
